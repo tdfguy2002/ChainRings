@@ -1,253 +1,352 @@
 'use strict';
 
+// ── Config ───────────────────────────────────────────────────────────────────
+const CHAIN_SPEED = 65; // mm/s in model units
+
+// ── Canvas ───────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('chain-canvas');
 const ctx    = canvas.getContext('2d');
 
-let lastResult = null;
-let transform  = { ox: 0, oy: 0, scale: 1 };
+let geo    = null;  // API response (with .pitch added)
+let pd     = null;  // precomputed path data (chain arc-length params)
+let tf     = { ox: 0, oy: 0, scale: 1 };
+let animId = null;
+const anim = { phase: 0, a1: 0, a2: 0, t: null };
 
-// ---------------------------------------------------------------------------
-// Canvas sizing
-// ---------------------------------------------------------------------------
-
+// ── Sizing ───────────────────────────────────────────────────────────────────
 function resizeCanvas() {
-  const container = document.getElementById('canvas-container');
-  canvas.width  = container.clientWidth;
-  canvas.height = container.clientHeight;
+  const el = document.getElementById('canvas-container');
+  canvas.width  = el.clientWidth;
+  canvas.height = el.clientHeight;
 }
+window.addEventListener('resize', resizeCanvas);
 
-window.addEventListener('resize', () => {
-  resizeCanvas();
-  if (lastResult) draw(lastResult);
-});
-
-// ---------------------------------------------------------------------------
-// Coordinate transform: math space (y-up) → canvas space (y-down)
-//   canvas_x = ox + mx * scale
-//   canvas_y = oy - my * scale   ← y negated
-// ---------------------------------------------------------------------------
-
+// ── Transform: math coords (y-up) → canvas coords (y-down) ──────────────────
 function toCanvas(mx, my) {
-  return [
-    transform.ox + mx * transform.scale,
-    transform.oy - my * transform.scale,
-  ];
+  return [tf.ox + mx * tf.scale, tf.oy - my * tf.scale];
 }
 
-function computeTransform(data) {
-  const PADDING = 48;
-
-  const R1 = data.ring1.radius;
-  const R2 = data.ring2.radius;
-  const D  = data.ring2.cx;
-
-  const minX = -R1;
-  const maxX = D + R2;
-  const maxY = Math.max(R1, R2);
-
-  const sceneW = maxX - minX;
-  const sceneH = 2 * maxY;
-
-  const availW = canvas.width  - 2 * PADDING;
-  const availH = canvas.height - 2 * PADDING;
-
-  const scale = Math.min(availW / sceneW, availH / sceneH);
-
-  const cx = (minX + maxX) / 2;
-
-  transform = {
-    ox: canvas.width  / 2 - cx * scale,
-    oy: canvas.height / 2,             // y=0 is the horizontal centerline
-    scale,
+function computeTransform(g) {
+  const PAD   = 60;
+  const R1    = g.ring1.radius, R2 = g.ring2.radius, D = g.ring2.cx;
+  const extra = 0.4 * g.pitch;
+  const minX  = -(R1 + extra), maxX = D + R2 + extra;
+  const maxY  = Math.max(R1, R2) + extra;
+  const sc    = Math.min(
+    (canvas.width  - 2 * PAD) / (maxX - minX),
+    (canvas.height - 2 * PAD) / (2 * maxY)
+  );
+  tf = {
+    ox:    canvas.width  / 2 - ((minX + maxX) / 2) * sc,
+    oy:    canvas.height / 2,
+    scale: sc,
   };
 }
 
-// ---------------------------------------------------------------------------
-// Drawing helpers
-// ---------------------------------------------------------------------------
-
-function drawPitchCircle(cx, cy, r) {
-  const [ccx, ccy] = toCanvas(cx, cy);
-  const rs = r * transform.scale;
-  ctx.save();
-  ctx.beginPath();
-  ctx.setLineDash([6, 4]);
-  ctx.strokeStyle = '#336688';
-  ctx.lineWidth   = 1.5;
-  ctx.arc(ccx, ccy, rs, 0, 2 * Math.PI);
-  ctx.stroke();
-  ctx.restore();
-}
-
-function drawTeeth(ringData, anglesArray) {
-  const [ccx, ccy] = toCanvas(ringData.cx, ringData.cy);
-  const rs      = ringData.radius * transform.scale;
-  const tickLen = Math.max(4, rs * 0.065);
-
-  ctx.save();
-  ctx.strokeStyle = '#5599cc';
-  ctx.lineWidth   = 1.5;
-  ctx.beginPath();
-  for (const mathAngle of anglesArray) {
-    // Negate math angle for y-flip (CCW math → CW canvas)
-    const ca  = -mathAngle;
-    const cos = Math.cos(ca);
-    const sin = Math.sin(ca);
-    ctx.moveTo(ccx + (rs - tickLen) * cos, ccy + (rs - tickLen) * sin);
-    ctx.lineTo(ccx + (rs + tickLen) * cos, ccy + (rs + tickLen) * sin);
-  }
-  ctx.stroke();
-  ctx.restore();
-}
-
-// Draw the chain path as a single continuous path:
-//   arc1 (ring1, CCW long arc)
+// ── Chain path precomputation ────────────────────────────────────────────────
+// Chain loop order:
+//   arc1  (ring1, long wrap, CW in canvas)
 //   → upper span (P_top_1 → P_top_2)
-//   → arc2 (ring2, CW short arc)
+//   → arc2  (ring2, short wrap, CW in canvas)
 //   → lower span (P_bot_2 → P_bot_1)
 //
-// Y-flip rules:
-//   - angle passed to canvas.arc() = -math_angle
-//   - counterclockwise flag passed = !arc.counterclockwise
-//     (y-flip reverses winding direction)
-function drawChainPath(data) {
-  const arc1 = data.arcs[0];
-  const arc2 = data.arcs[1];
+// Canvas arc angles are negated math angles because y is flipped.
+// Arc1 canvas start angle = -arc1.start_angle, goes CW (angle increases).
+// Arc2 canvas start angle = -arc2.start_angle, goes CW (angle increases).
 
-  const [a1cx, a1cy] = toCanvas(arc1.cx, arc1.cy);
-  const r1s = arc1.radius * transform.scale;
+function buildPd(g) {
+  const phi1 = g.wrap_angle1 * Math.PI / 180;
+  const phi2 = g.wrap_angle2 * Math.PI / 180;
+  const S1   = g.ring1.radius * phi1;   // arc1 arc-length
+  const S3   = g.ring2.radius * phi2;   // arc2 arc-length
+  const t0   = g.tangents[0];           // upper span endpoints
+  const Ls   = Math.hypot(t0.x2 - t0.x1, t0.y2 - t0.y1);
+  pd = {
+    R1:  g.ring1.radius,
+    R2:  g.ring2.radius,
+    S1, S3, Ls,
+    total: g.chain_length,
+    th1: -g.arcs[0].start_angle,   // canvas start angle of arc1
+    th2: -g.arcs[1].start_angle,   // canvas start angle of arc2
+  };
+}
 
-  const [a2cx, a2cy] = toCanvas(arc2.cx, arc2.cy);
-  const r2s = arc2.radius * transform.scale;
+// Returns {x, y} in canvas pixels at arc-length s along the chain loop.
+function chainPoint(g, s) {
+  const { R1, R2, S1, S3, Ls, total, th1, th2 } = pd;
+  s = ((s % total) + total) % total;
+  const sc = tf.scale;
 
-  // P_top_2 — end of upper span, start of arc2
-  const [t1x2, t1y2] = toCanvas(data.tangents[0].x2, data.tangents[0].y2);
-  // P_bot_1 — end of lower span, back to arc1 start
-  const [t2x2, t2y2] = toCanvas(data.tangents[1].x2, data.tangents[1].y2);
+  if (s < S1) {
+    // Arc1: ring1
+    const [cx, cy] = toCanvas(g.arcs[0].cx, g.arcs[0].cy);
+    const a = th1 + s / R1;
+    return { x: cx + R1 * sc * Math.cos(a), y: cy + R1 * sc * Math.sin(a) };
+  }
+  s -= S1;
 
-  ctx.save();
+  if (s < Ls) {
+    // Upper span
+    const t = s / Ls;
+    const [x1, y1] = toCanvas(g.tangents[0].x1, g.tangents[0].y1);
+    const [x2, y2] = toCanvas(g.tangents[0].x2, g.tangents[0].y2);
+    return { x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t };
+  }
+  s -= Ls;
+
+  if (s < S3) {
+    // Arc2: ring2
+    const [cx, cy] = toCanvas(g.arcs[1].cx, g.arcs[1].cy);
+    const a = th2 + s / R2;
+    return { x: cx + R2 * sc * Math.cos(a), y: cy + R2 * sc * Math.sin(a) };
+  }
+  s -= S3;
+
+  // Lower span
+  const t = s / Ls;
+  const [x1, y1] = toCanvas(g.tangents[1].x1, g.tangents[1].y1);
+  const [x2, y2] = toCanvas(g.tangents[1].x2, g.tangents[1].y2);
+  return { x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t };
+}
+
+// ── Chain rendering ───────────────────────────────────────────────────────────
+// Each "plate" is a stadium (capsule) shape between two adjacent roller centres.
+// Even-indexed links = outer plates (wider), odd = inner plates (narrower).
+function drawStadium(x0, y0, x1, y1, hw, color) {
+  const dx  = x1 - x0, dy = y1 - y0;
+  const len = Math.hypot(dx, dy);
+  if (len < 0.5) return;
+  const nx = -dy / len, ny = dx / len;    // unit normal
+  const a0 = Math.atan2(ny, nx);          // normal angle
   ctx.beginPath();
-  ctx.strokeStyle = '#c8a400';
-  ctx.lineWidth   = Math.max(2, 4 * Math.min(1, transform.scale / 2));
-  ctx.lineJoin    = 'round';
-
-  // Arc 1: ring1, CCW in math → CW in canvas (!counterclockwise)
-  ctx.arc(a1cx, a1cy, r1s,
-    -arc1.start_angle,
-    -arc1.end_angle,
-    !arc1.counterclockwise);
-
-  // Upper span: arc1 exit = P_top_1, connect to P_top_2
-  ctx.lineTo(t1x2, t1y2);
-
-  // Arc 2: ring2, CW in math → CCW in canvas (!counterclockwise)
-  ctx.arc(a2cx, a2cy, r2s,
-    -arc2.start_angle,
-    -arc2.end_angle,
-    !arc2.counterclockwise);
-
-  // Lower span: arc2 exit = P_bot_2, connect to P_bot_1
-  ctx.lineTo(t2x2, t2y2);
-
+  ctx.arc(x0, y0, hw, a0,           a0 + Math.PI, false); // left cap
+  ctx.lineTo(x1 - nx * hw, y1 - ny * hw);
+  ctx.arc(x1, y1, hw, a0 + Math.PI, a0,           false); // right cap
   ctx.closePath();
-  ctx.stroke();
-  ctx.restore();
+  ctx.fillStyle = color;
+  ctx.fill();
 }
 
-function drawCenter(cx, cy, label) {
-  const [ccx, ccy] = toCanvas(cx, cy);
-  const ARM = 8;
+function drawChain(g, phase) {
+  const N    = g.num_links;
+  const step = g.chain_length / N;
+  const sc   = tf.scale;
+
+  const rollerR = Math.max(1.2, 3.97 * sc);
+  const outerHW = Math.max(0.9, 3.6  * sc);
+  const innerHW = Math.max(0.6, 2.5  * sc);
+
+  // Pre-compute all joint positions (avoids double-computing shared endpoints)
+  const pts = new Array(N);
+  for (let i = 0; i < N; i++) pts[i] = chainPoint(g, phase + i * step);
+
+  // Plates
+  for (let i = 0; i < N; i++) {
+    const p0 = pts[i], p1 = pts[(i + 1) % N];
+    const outer = (i & 1) === 0;
+    drawStadium(p0.x, p0.y, p1.x, p1.y,
+      outer ? outerHW : innerHW,
+      outer ? '#506070' : '#384858');
+  }
+
+  // Rollers (drawn after plates so they sit on top)
+  for (let i = 0; i < N; i++) {
+    const { x, y } = pts[i];
+    ctx.beginPath();
+    ctx.arc(x, y, rollerR, 0, Math.PI * 2);
+    ctx.fillStyle = '#c08808';
+    ctx.fill();
+    if (rollerR > 2.0) {
+      ctx.strokeStyle = '#7a5500';
+      ctx.lineWidth   = Math.max(0.3, 0.55 * sc);
+      ctx.stroke();
+      // Centre pin
+      ctx.beginPath();
+      ctx.arc(x, y, rollerR * 0.35, 0, Math.PI * 2);
+      ctx.fillStyle = '#1c1c2a';
+      ctx.fill();
+    }
+  }
+}
+
+// ── Chainring rendering ───────────────────────────────────────────────────────
+// Builds the sprocket tooth outline in local (ring-centred) coordinates.
+// Teeth are symmetric: valley → left-shoulder → tip → right-shoulder → valley.
+function buildToothPath(N, rTip, rRoot, rotation) {
+  const p  = Math.PI * 2 / N;
+  const tw = 0.22;   // tooth half-width as fraction of pitch angle
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const θ  = rotation + i * p;
+    const vl = θ - p * 0.5;
+    const sl = θ - p * tw;
+    const sr = θ + p * tw;
+    const vr = θ + p * 0.5;
+    if (i === 0) ctx.moveTo(rRoot * Math.cos(vl), rRoot * Math.sin(vl));
+    else         ctx.lineTo(rRoot * Math.cos(vl), rRoot * Math.sin(vl));
+    ctx.lineTo(rTip  * Math.cos(sl), rTip  * Math.sin(sl));
+    ctx.lineTo(rTip  * Math.cos(θ),  rTip  * Math.sin(θ));   // tip
+    ctx.lineTo(rTip  * Math.cos(sr), rTip  * Math.sin(sr));
+    ctx.lineTo(rRoot * Math.cos(vr), rRoot * Math.sin(vr));
+  }
+  ctx.closePath();
+}
+
+function drawRing(ring, N, pitchMM, angle) {
+  const [cx, cy] = toCanvas(ring.cx, ring.cy);
+  const sc = tf.scale;
+  const R  = ring.radius;
+
+  // Geometry (all in canvas pixels, in local ring-centred coords)
+  const rTip  = (R + 0.32 * pitchMM) * sc;
+  const rRoot = (R - 0.32 * pitchMM) * sc;
+  const rBody = rRoot * 0.80;                        // inner edge of ring body
+  const rHub  = Math.max(5, R * 0.20 * sc);
+  const rBore = Math.max(2, R * 0.10 * sc);
+  const rBCD  = R * 0.62 * sc;                       // bolt-circle radius
+  const rBolt = Math.max(1.5, R * 0.038 * sc);
+
+  const ARMS  = N >= 30 ? 5 : 4;
+  const armP  = Math.PI * 2 / ARMS;
+  const aHalf = 0.22;    // arm angular half-width as fraction of armP
 
   ctx.save();
-  ctx.strokeStyle = '#888899';
-  ctx.lineWidth   = 1;
+  ctx.translate(cx, cy);
+
+  // ── 1. Tooth polygon (fills from centre to tip) ──────────────────────────
+  ctx.fillStyle = '#52606e';
+  buildToothPath(N, rTip, rRoot, angle);
+  ctx.fill();
+
+  // ── 2. Solid ring body (donut rBody → rRoot, fills any valley gaps) ──────
+  ctx.fillStyle = '#52606e';
   ctx.beginPath();
-  ctx.moveTo(ccx - ARM, ccy); ctx.lineTo(ccx + ARM, ccy);
-  ctx.moveTo(ccx, ccy - ARM); ctx.lineTo(ccx, ccy + ARM);
+  ctx.arc(0, 0, rRoot, 0, Math.PI * 2, false);
+  ctx.moveTo(rBody, 0);
+  ctx.arc(0, 0, rBody, 0, Math.PI * 2, true);
+  ctx.fill('evenodd');
+
+  // ── 3. Arm windows (cut background colour between arms) ──────────────────
+  ctx.fillStyle = '#0d0d1a';
+  for (let a = 0; a < ARMS; a++) {
+    const ac = angle + a * armP;
+    const wL = ac + aHalf * armP;
+    const wR = ac + (1 - aHalf) * armP;
+    ctx.beginPath();
+    ctx.arc(0, 0, rBody * 0.97, wL, wR, false);  // outer arc of window
+    ctx.arc(0, 0, rHub  * 1.35, wR, wL, true);   // inner arc (reversed)
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ── 4. Hub ────────────────────────────────────────────────────────────────
+  ctx.fillStyle = '#52606e';
+  ctx.beginPath();
+  ctx.arc(0, 0, rHub, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── 5. Bolt holes (centred on each arm) ──────────────────────────────────
+  ctx.fillStyle = '#0d0d1a';
+  for (let a = 0; a < ARMS; a++) {
+    const ba = angle + a * armP;
+    ctx.beginPath();
+    ctx.arc(rBCD * Math.cos(ba), rBCD * Math.sin(ba), rBolt, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ── 6. Centre bore ────────────────────────────────────────────────────────
+  ctx.beginPath();
+  ctx.arc(0, 0, rBore, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── 7. Tooth edge highlight ───────────────────────────────────────────────
+  ctx.strokeStyle = '#8898aa';
+  ctx.lineWidth   = Math.max(0.4, 0.5 * sc);
+  buildToothPath(N, rTip, rRoot, angle);
   ctx.stroke();
 
-  ctx.fillStyle = '#888899';
-  ctx.font      = '11px system-ui';
-  ctx.fillText(label, ccx + ARM + 4, ccy - ARM);
   ctx.restore();
 }
 
-// ---------------------------------------------------------------------------
-// Master draw
-// ---------------------------------------------------------------------------
+// ── Animation loop ────────────────────────────────────────────────────────────
+function frame(ts) {
+  if (!geo) return;
+  if (anim.t === null) anim.t = ts;
+  const dt = Math.min((ts - anim.t) / 1000, 0.05);  // cap at 50 ms
+  anim.t = ts;
 
-function draw(data) {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  computeTransform(data);
+  const d = CHAIN_SPEED * dt;
+  anim.phase = (anim.phase + d) % geo.chain_length;
+  anim.a1    = (anim.a1 + d / geo.ring1.radius) % (Math.PI * 2);
+  anim.a2    = (anim.a2 + d / geo.ring2.radius) % (Math.PI * 2);
 
-  drawPitchCircle(data.ring1.cx, data.ring1.cy, data.ring1.radius);
-  drawPitchCircle(data.ring2.cx, data.ring2.cy, data.ring2.radius);
-
-  drawTeeth(data.ring1, data.teeth_angles.ring1);
-  drawTeeth(data.ring2, data.teeth_angles.ring2);
-
-  drawChainPath(data);
-
-  drawCenter(data.ring1.cx, data.ring1.cy, 'R1');
-  drawCenter(data.ring2.cx, data.ring2.cy, 'R2');
+  render();
+  animId = requestAnimationFrame(frame);
 }
 
-// ---------------------------------------------------------------------------
-// API + UI
-// ---------------------------------------------------------------------------
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  computeTransform(geo);
 
+  const N1    = geo.teeth_angles.ring1.length;
+  const N2    = geo.teeth_angles.ring2.length;
+  const pitch = geo.pitch;
+
+  drawRing(geo.ring1, N1, pitch, anim.a1);
+  drawRing(geo.ring2, N2, pitch, anim.a2);
+  drawChain(geo, anim.phase);
+}
+
+// ── API + UI ─────────────────────────────────────────────────────────────────
 async function calculate() {
-  const errorEl = document.getElementById('error-msg');
+  const errEl   = document.getElementById('error-msg');
   const statsEl = document.getElementById('stats');
-
-  errorEl.classList.add('hidden');
+  errEl.classList.add('hidden');
   statsEl.classList.add('hidden');
 
   const payload = {
-    teeth1:          parseInt(document.getElementById('teeth1').value, 10),
-    teeth2:          parseInt(document.getElementById('teeth2').value, 10),
+    teeth1:          parseInt(document.getElementById('teeth1').value,  10),
+    teeth2:          parseInt(document.getElementById('teeth2').value,  10),
     center_distance: parseFloat(document.getElementById('center_distance').value),
     pitch:           parseFloat(document.getElementById('pitch').value),
   };
 
   try {
-    const response = await fetch('/api/calculate', {
+    const res  = await fetch('/api/calculate', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(payload),
     });
+    const data = await res.json();
 
-    const data = await response.json();
-
-    if (!response.ok) {
-      errorEl.textContent = data.error || 'Unknown error.';
-      errorEl.classList.remove('hidden');
+    if (!res.ok) {
+      errEl.textContent = data.error || 'Unknown error.';
+      errEl.classList.remove('hidden');
       return;
     }
 
-    lastResult = data;
-    draw(data);
+    data.pitch = payload.pitch;  // attach for rendering
+    geo = data;
+    buildPd(data);
 
-    document.getElementById('stat-length').textContent =
-      data.chain_length.toFixed(1);
-    document.getElementById('stat-links').textContent =
-      data.num_links;
-    document.getElementById('stat-adj-center').textContent =
-      data.adjusted_center.toFixed(2);
-    document.getElementById('stat-wrap1').textContent =
-      data.wrap_angle1.toFixed(1);
-    document.getElementById('stat-wrap2').textContent =
-      data.wrap_angle2.toFixed(1);
+    if (animId !== null) cancelAnimationFrame(animId);
+    anim.phase = 0; anim.a1 = 0; anim.a2 = 0; anim.t = null;
+    animId = requestAnimationFrame(frame);
+
+    document.getElementById('stat-length').textContent     = data.chain_length.toFixed(1);
+    document.getElementById('stat-links').textContent      = data.num_links;
+    document.getElementById('stat-adj-center').textContent = data.adjusted_center.toFixed(2);
+    document.getElementById('stat-wrap1').textContent      = data.wrap_angle1.toFixed(1);
+    document.getElementById('stat-wrap2').textContent      = data.wrap_angle2.toFixed(1);
     statsEl.classList.remove('hidden');
 
   } catch (err) {
-    errorEl.textContent = 'Network error: ' + err.message;
-    errorEl.classList.remove('hidden');
+    errEl.textContent = 'Network error: ' + err.message;
+    errEl.classList.remove('hidden');
   }
 }
 
 document.getElementById('calculate-btn').addEventListener('click', calculate);
 
-// Run on load with default values
 resizeCanvas();
 calculate();
