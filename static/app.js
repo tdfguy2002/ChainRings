@@ -232,6 +232,8 @@ async function calculate() {
       data.chain_length.toFixed(1);
     document.getElementById('stat-links').textContent =
       data.num_links;
+    document.getElementById('stat-adj-center').textContent =
+      data.adjusted_center.toFixed(2);
     document.getElementById('stat-wrap1').textContent =
       data.wrap_angle1.toFixed(1);
     document.getElementById('stat-wrap2').textContent =

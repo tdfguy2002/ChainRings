@@ -7,6 +7,30 @@ def pitch_circle_radius(N: int, pitch: float) -> float:
     return pitch / (2 * math.sin(math.pi / N))
 
 
+def _chain_length(R1: float, R2: float, D: float) -> float:
+    K = R1 - R2
+    L_span = math.sqrt(D * D - K * K)
+    phi1 = math.pi + 2 * math.asin(K / D)
+    phi2 = math.pi - 2 * math.asin(K / D)
+    return 2 * L_span + R1 * phi1 + R2 * phi2
+
+
+def _center_for_links(R1: float, R2: float, pitch: float, target_links: int, D_init: float) -> float:
+    """Newton's method: find D such that chain_length(D) == target_links * pitch."""
+    target = target_links * pitch
+    K = R1 - R2
+    D = D_init
+    for _ in range(60):
+        L_span = math.sqrt(D * D - K * K)
+        f  = _chain_length(R1, R2, D) - target
+        fp = 2 * L_span / D          # derivative d(chain_length)/dD
+        step = f / fp
+        D -= step
+        if abs(step) < 1e-10:
+            break
+    return D
+
+
 def compute_geometry(
     teeth1: int, teeth2: int, center_distance: float, pitch: float
 ) -> dict:
@@ -35,9 +59,15 @@ def compute_geometry(
     phi2 = math.pi - 2 * math.asin((R1 - R2) / D)  # ring 2, short arc (front side)
 
     chain_length = 2 * L_span + R1 * phi1 + R2 * phi2
-    num_links = round(chain_length / pitch)
-    if num_links % 2 != 0:
-        num_links += 1
+    raw_links = chain_length / pitch
+    lower_even = int(raw_links // 2) * 2
+    upper_even = lower_even + 2
+    if (raw_links - lower_even) <= (upper_even - raw_links):
+        num_links = lower_even
+    else:
+        num_links = upper_even
+
+    adjusted_center = _center_for_links(R1, R2, pitch, num_links, D)
 
     # Arc angles in math space (CCW from +x axis)
     # Ring 1: from P_bot_1 to P_top_1, counterclockwise (long arc, around the back)
@@ -74,10 +104,11 @@ def compute_geometry(
                 "counterclockwise": True,
             },
         ],
-        "chain_length": round(chain_length, 4),
-        "num_links":    num_links,
-        "wrap_angle1":  round(math.degrees(phi1), 2),
-        "wrap_angle2":  round(math.degrees(phi2), 2),
+        "chain_length":    round(chain_length, 4),
+        "num_links":       num_links,
+        "adjusted_center": round(adjusted_center, 4),
+        "wrap_angle1":     round(math.degrees(phi1), 2),
+        "wrap_angle2":     round(math.degrees(phi2), 2),
         "teeth_angles": {
             "ring1": ring1_angles,
             "ring2": ring2_angles,
