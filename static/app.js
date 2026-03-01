@@ -129,24 +129,28 @@ function drawStadium(x0, y0, x1, y1, hw, color) {
 
 function drawChain(g, phase) {
   const N    = g.num_links;
-  const step = g.chain_length / N;
+  const step = g.chain_length / N;   // effective pitch in mm
   const sc   = tf.scale;
 
-  const rollerR = Math.max(1.2, 3.97 * sc);
-  const outerHW = Math.max(0.9, 3.6  * sc);
-  const innerHW = Math.max(0.6, 2.5  * sc);
+  // Proportions derived from real 1/2" bicycle chain geometry (fractions of pitch).
+  // rollerR < innerHW < outerHW so rollers are framed by the plates, not wider.
+  const rollerR = Math.max(1.2, 0.285 * step * sc);
+  const innerHW = Math.max(0.8, 0.340 * step * sc);
+  const outerHW = Math.max(1.0, 0.385 * step * sc);
 
   // Pre-compute all joint positions (avoids double-computing shared endpoints)
   const pts = new Array(N);
   for (let i = 0; i < N; i++) pts[i] = chainPoint(g, phase + i * step);
 
-  // Plates
-  for (let i = 0; i < N; i++) {
+  // 1. Inner plates first — they sit behind the outer plates when viewed from outside
+  for (let i = 1; i < N; i += 2) {
     const p0 = pts[i], p1 = pts[(i + 1) % N];
-    const outer = (i & 1) === 0;
-    drawStadium(p0.x, p0.y, p1.x, p1.y,
-      outer ? outerHW : innerHW,
-      outer ? '#506070' : '#384858');
+    drawStadium(p0.x, p0.y, p1.x, p1.y, innerHW, '#384858');
+  }
+  // 2. Outer plates on top
+  for (let i = 0; i < N; i += 2) {
+    const p0 = pts[i], p1 = pts[(i + 1) % N];
+    drawStadium(p0.x, p0.y, p1.x, p1.y, outerHW, '#506070');
   }
 
   // Rollers (drawn after plates so they sit on top)
@@ -170,11 +174,10 @@ function drawChain(g, phase) {
 }
 
 // ── Chainring rendering ───────────────────────────────────────────────────────
-// Builds the sprocket tooth outline in local (ring-centred) coordinates.
-// Teeth are symmetric: valley → left-shoulder → tip → right-shoulder → valley.
+// Narrow, pointed teeth matching the Dura-Ace profile.
 function buildToothPath(N, rTip, rRoot, rotation) {
   const p  = Math.PI * 2 / N;
-  const tw = 0.22;   // tooth half-width as fraction of pitch angle
+  const tw = 0.14;   // tooth half-width — narrower/more pointed than before
   ctx.beginPath();
   for (let i = 0; i < N; i++) {
     const θ  = rotation + i * p;
@@ -197,56 +200,91 @@ function drawRing(ring, N, pitchMM, angle) {
   const sc = tf.scale;
   const R  = ring.radius;
 
-  // Geometry (all in canvas pixels, in local ring-centred coords)
-  const rTip  = (R + 0.32 * pitchMM) * sc;
-  const rRoot = (R - 0.32 * pitchMM) * sc;
-  const rBody = rRoot * 0.80;                        // inner edge of ring body
-  const rHub  = Math.max(5, R * 0.20 * sc);
-  const rBore = Math.max(2, R * 0.10 * sc);
-  const rBCD  = R * 0.62 * sc;                       // bolt-circle radius
-  const rBolt = Math.max(1.5, R * 0.038 * sc);
+  // Geometry (canvas pixels, in local ring-centred coords after translate)
+  const rTip       = (R + 0.40 * pitchMM) * sc;   // taller teeth
+  const rRoot      = (R - 0.32 * pitchMM) * sc;
+  const rBody      = rRoot * 0.88;                  // thin solid ring rim
+  const rHub       = Math.max(6,   R * 0.22 * sc);
+  const rBore      = Math.max(2.5, R * 0.10 * sc);
+  const rBCD       = R * 0.62 * sc;
+  const rBolt      = Math.max(1.5, R * 0.036 * sc);
+  const rArmOuter  = rBody * 1.01;   // arms bleed slightly into ring body for a clean join
+  const rArmInner  = rHub  * 1.30;
 
-  const ARMS  = N >= 30 ? 5 : 4;
-  const armP  = Math.PI * 2 / ARMS;
-  const aHalf = 0.22;    // arm angular half-width as fraction of armP
+  const ARMS       = N >= 30 ? 5 : 4;
+  const armP       = Math.PI * 2 / ARMS;
+  const aHalf      = 0.13;           // arm angular half-width fraction — narrow = large open windows
+  // How far each arm side curves into the adjacent window (creates concave window edges)
+  const curveBias  = 0.55 * aHalf * armP;
 
   ctx.save();
   ctx.translate(cx, cy);
 
-  // ── 1. Tooth polygon (fills from centre to tip) ──────────────────────────
-  ctx.fillStyle = '#52606e';
+  // Machined-aluminium radial gradient: dark at hub → bright silver at outer edge
+  const silver = ctx.createRadialGradient(0, 0, rHub * 0.8, 0, 0, rTip);
+  silver.addColorStop(0.00, '#5c6878');
+  silver.addColorStop(0.30, '#788898');
+  silver.addColorStop(0.72, '#a2b2c2');
+  silver.addColorStop(1.00, '#ccd8e4');
+
+  // ── 1. Tooth polygon ──────────────────────────────────────────────────────
+  ctx.fillStyle = silver;
   buildToothPath(N, rTip, rRoot, angle);
   ctx.fill();
 
-  // ── 2. Solid ring body (donut rBody → rRoot, fills any valley gaps) ──────
-  ctx.fillStyle = '#52606e';
+  // ── 2. Thin solid ring rim (rBody → rRoot) ────────────────────────────────
+  ctx.fillStyle = silver;
   ctx.beginPath();
   ctx.arc(0, 0, rRoot, 0, Math.PI * 2, false);
   ctx.moveTo(rBody, 0);
   ctx.arc(0, 0, rBody, 0, Math.PI * 2, true);
   ctx.fill('evenodd');
 
-  // ── 3. Arm windows (cut background colour between arms) ──────────────────
-  ctx.fillStyle = '#0d0d1a';
+  // ── 3. Dark spider background ─────────────────────────────────────────────
+  ctx.fillStyle = '#111418';
+  ctx.beginPath();
+  ctx.arc(0, 0, rBody, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── 4. Arms (silver over dark background, sides curve into adjacent windows)
+  //
+  // Each arm side uses a quadratic bezier whose control point is pushed
+  // outward past the arm edge (into the neighbouring window).  This makes
+  // the arm sides bow convexly outward, giving each window a concave "C"
+  // edge — the classic Shimano spider look.
+  const rMidArm = (rArmOuter + rArmInner) * 0.5;
+  ctx.fillStyle = silver;
   for (let a = 0; a < ARMS; a++) {
     const ac = angle + a * armP;
-    const wL = ac + aHalf * armP;
-    const wR = ac + (1 - aHalf) * armP;
+    const aL = ac - aHalf * armP;
+    const aR = ac + aHalf * armP;
     ctx.beginPath();
-    ctx.arc(0, 0, rBody * 0.97, wL, wR, false);  // outer arc of window
-    ctx.arc(0, 0, rHub  * 1.35, wR, wL, true);   // inner arc (reversed)
+    // Outer arc (CW from aL to aR)
+    ctx.arc(0, 0, rArmOuter, aL, aR, false);
+    // Right side → curves into the window to the right of this arm
+    ctx.quadraticCurveTo(
+      rMidArm * Math.cos(aR + curveBias), rMidArm * Math.sin(aR + curveBias),
+      rArmInner * Math.cos(aR),           rArmInner * Math.sin(aR)
+    );
+    // Inner arc (CCW from aR back to aL)
+    ctx.arc(0, 0, rArmInner, aR, aL, true);
+    // Left side → curves into the window to the left of this arm
+    ctx.quadraticCurveTo(
+      rMidArm * Math.cos(aL - curveBias), rMidArm * Math.sin(aL - curveBias),
+      rArmOuter * Math.cos(aL),           rArmOuter * Math.sin(aL)
+    );
     ctx.closePath();
     ctx.fill();
   }
 
-  // ── 4. Hub ────────────────────────────────────────────────────────────────
-  ctx.fillStyle = '#52606e';
+  // ── 5. Hub ────────────────────────────────────────────────────────────────
+  ctx.fillStyle = silver;
   ctx.beginPath();
   ctx.arc(0, 0, rHub, 0, Math.PI * 2);
   ctx.fill();
 
-  // ── 5. Bolt holes (centred on each arm) ──────────────────────────────────
-  ctx.fillStyle = '#0d0d1a';
+  // ── 6. Bolt holes (centred on each arm) ──────────────────────────────────
+  ctx.fillStyle = '#111418';
   for (let a = 0; a < ARMS; a++) {
     const ba = angle + a * armP;
     ctx.beginPath();
@@ -254,15 +292,22 @@ function drawRing(ring, N, pitchMM, angle) {
     ctx.fill();
   }
 
-  // ── 6. Centre bore ────────────────────────────────────────────────────────
+  // ── 7. Centre bore ────────────────────────────────────────────────────────
   ctx.beginPath();
   ctx.arc(0, 0, rBore, 0, Math.PI * 2);
   ctx.fill();
 
-  // ── 7. Tooth edge highlight ───────────────────────────────────────────────
-  ctx.strokeStyle = '#8898aa';
-  ctx.lineWidth   = Math.max(0.4, 0.5 * sc);
+  // ── 8. Bright machined edge on tooth tips ─────────────────────────────────
+  ctx.strokeStyle = '#e0ecf4';
+  ctx.lineWidth   = Math.max(0.5, 0.7 * sc);
   buildToothPath(N, rTip, rRoot, angle);
+  ctx.stroke();
+
+  // ── 9. Inner ring-body edge (step between rim and spider area) ────────────
+  ctx.strokeStyle = '#8090a2';
+  ctx.lineWidth   = Math.max(0.5, 0.9 * sc);
+  ctx.beginPath();
+  ctx.arc(0, 0, rBody, 0, Math.PI * 2);
   ctx.stroke();
 
   ctx.restore();
