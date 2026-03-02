@@ -85,6 +85,27 @@ button:active {
   background: #a02a42;
 }
 
+button.secondary {
+  background: #2a9d6a;
+  border: 1px solid #2a9d6a;
+  color: white;
+  margin-top: 6px;
+}
+
+button.secondary:hover:not(:disabled) {
+  background: #34b87c;
+  border-color: #34b87c;
+}
+
+button.secondary:active:not(:disabled) {
+  background: #1e7a52;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
 .error {
   color: #ff6b6b;
   font-size: 0.8rem;
@@ -108,7 +129,7 @@ button:active {
 }
 
 #stats strong {
-  display: block;
+  display: inline-block;
   font-size: 1.3rem;
   color: #e0e0e0;
   margin-top: 2px;

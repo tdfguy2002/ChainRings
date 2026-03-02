@@ -3,14 +3,18 @@
 // ── Config ───────────────────────────────────────────────────────────────────
 const CHAIN_SPEED = 65; // mm/s in model units
 
-// ── Canvas ───────────────────────────────────────────────────────────────────
-const canvas = document.getElementById('chain-canvas');
-const ctx    = canvas.getContext('2d');
+// ── Canvas + UI elements ─────────────────────────────────────────────────────
+const canvas    = document.getElementById('chain-canvas');
+const ctx       = canvas.getContext('2d');
+const pauseBtn  = document.getElementById('pause-btn');
+const errEl     = document.getElementById('error-msg');
+const statsEl   = document.getElementById('stats');
 
 let geo    = null;  // API response (with .pitch added)
 let pd     = null;  // precomputed path data (chain arc-length params)
 let tf     = { ox: 0, oy: 0, scale: 1 };
 let animId = null;
+let paused = false;
 const anim = { phase: 0, a1: 0, a2: 0, t: null };
 
 // ── Sizing ───────────────────────────────────────────────────────────────────
@@ -19,7 +23,10 @@ function resizeCanvas() {
   canvas.width  = el.clientWidth;
   canvas.height = el.clientHeight;
 }
-window.addEventListener('resize', resizeCanvas);
+window.addEventListener('resize', () => {
+  resizeCanvas();
+  if (geo && paused) render();
+});
 
 // ── Transform: math coords (y-up) → canvas coords (y-down) ──────────────────
 function toCanvas(mx, my) {
@@ -174,24 +181,42 @@ function drawChain(g, phase) {
 }
 
 // ── Chainring rendering ───────────────────────────────────────────────────────
-// Narrow, pointed teeth matching the Dura-Ace profile.
+// Tooth profile: pointed tip, straight flanks, smooth curved valley arc.
+// Each valley is a circular arc at rRoot — no sharp V-corners.
 function buildToothPath(N, rTip, rRoot, rotation) {
-  const p  = Math.PI * 2 / N;
-  const tw = 0.14;   // tooth half-width — narrower/more pointed than before
+  const p    = Math.PI * 2 / N;
+  const tw   = 0.30;   // tooth half-width as fraction of pitch angle
+  const tcap = 0.08;   // rounded-tip half-width (must be < tw)
+  // Shallow valley — control point barely dips below rRoot
+  const rCP  = rRoot - 0.12 * (rTip - rRoot);
+
   ctx.beginPath();
+
+  const sl0 = rotation - p * tw;
+  ctx.moveTo(rRoot * Math.cos(sl0), rRoot * Math.sin(sl0));
+
   for (let i = 0; i < N; i++) {
-    const θ  = rotation + i * p;
-    const vl = θ - p * 0.5;
-    const sl = θ - p * tw;
-    const sr = θ + p * tw;
-    const vr = θ + p * 0.5;
-    if (i === 0) ctx.moveTo(rRoot * Math.cos(vl), rRoot * Math.sin(vl));
-    else         ctx.lineTo(rRoot * Math.cos(vl), rRoot * Math.sin(vl));
-    ctx.lineTo(rTip  * Math.cos(sl), rTip  * Math.sin(sl));
-    ctx.lineTo(rTip  * Math.cos(θ),  rTip  * Math.sin(θ));   // tip
-    ctx.lineTo(rTip  * Math.cos(sr), rTip  * Math.sin(sr));
-    ctx.lineTo(rRoot * Math.cos(vr), rRoot * Math.sin(vr));
+    const θ      = rotation + i * p;
+    const sr     = θ + p * tw;
+    const nextSl = θ + p * (1 - tw);
+    const θMid   = (sr + nextSl) * 0.5;
+
+    // Left flank up to just before the tip
+    ctx.lineTo(rTip * Math.cos(θ - p * tcap), rTip * Math.sin(θ - p * tcap));
+    // Rounded tip: quadratic bezier with control point a touch outside rTip
+    ctx.quadraticCurveTo(
+      rTip * 1.015 * Math.cos(θ), rTip * 1.015 * Math.sin(θ),
+      rTip * Math.cos(θ + p * tcap), rTip * Math.sin(θ + p * tcap)
+    );
+    // Right flank back down
+    ctx.lineTo(rRoot * Math.cos(sr), rRoot * Math.sin(sr));
+    // Shallow valley
+    ctx.quadraticCurveTo(
+      rCP * Math.cos(θMid), rCP * Math.sin(θMid),
+      rRoot * Math.cos(nextSl), rRoot * Math.sin(nextSl)
+    );
   }
+
   ctx.closePath();
 }
 
@@ -201,8 +226,8 @@ function drawRing(ring, N, pitchMM, angle) {
   const R  = ring.radius;
 
   // Geometry (canvas pixels, in local ring-centred coords after translate)
-  const rTip       = (R + 0.40 * pitchMM) * sc;   // taller teeth
-  const rRoot      = (R - 0.32 * pitchMM) * sc;
+  const rTip       = (R + 0.12 * pitchMM) * sc;   // short, realistic tooth tip
+  const rRoot      = (R - 0.28 * pitchMM) * sc;   // roller-radius depth
   const rBody      = rRoot * 0.88;                  // thin solid ring rim
   const rHub       = Math.max(6,   R * 0.22 * sc);
   const rBore      = Math.max(2.5, R * 0.10 * sc);
@@ -315,7 +340,7 @@ function drawRing(ring, N, pitchMM, angle) {
 
 // ── Animation loop ────────────────────────────────────────────────────────────
 function frame(ts) {
-  if (!geo) return;
+  if (!geo || paused) return;
   if (anim.t === null) anim.t = ts;
   const dt = Math.min((ts - anim.t) / 1000, 0.05);  // cap at 50 ms
   anim.t = ts;
@@ -344,8 +369,7 @@ function render() {
 
 // ── API + UI ─────────────────────────────────────────────────────────────────
 async function calculate() {
-  const errEl   = document.getElementById('error-msg');
-  const statsEl = document.getElementById('stats');
+  resizeCanvas();  // ensure canvas matches current container size
   errEl.classList.add('hidden');
   statsEl.classList.add('hidden');
 
@@ -356,42 +380,72 @@ async function calculate() {
     pitch:           parseFloat(document.getElementById('pitch').value),
   };
 
+  let data;
   try {
-    const res  = await fetch('/api/calculate', {
+    const res = await fetch('/api/calculate', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(payload),
     });
-    const data = await res.json();
-
+    data = await res.json();
     if (!res.ok) {
       errEl.textContent = data.error || 'Unknown error.';
       errEl.classList.remove('hidden');
       return;
     }
-
-    data.pitch = payload.pitch;  // attach for rendering
-    geo = data;
-    buildPd(data);
-
-    if (animId !== null) cancelAnimationFrame(animId);
-    anim.phase = 0; anim.a1 = 0; anim.a2 = 0; anim.t = null;
-    animId = requestAnimationFrame(frame);
-
-    document.getElementById('stat-length').textContent     = data.chain_length.toFixed(1);
-    document.getElementById('stat-links').textContent      = data.num_links;
-    document.getElementById('stat-adj-center').textContent = data.adjusted_center.toFixed(2);
-    document.getElementById('stat-wrap1').textContent      = data.wrap_angle1.toFixed(1);
-    document.getElementById('stat-wrap2').textContent      = data.wrap_angle2.toFixed(1);
-    statsEl.classList.remove('hidden');
-
   } catch (err) {
     errEl.textContent = 'Network error: ' + err.message;
     errEl.classList.remove('hidden');
+    return;
+  }
+
+  // — fetch succeeded; all code below is plain JS, not a network operation —
+  data.pitch = payload.pitch;
+  geo = data;
+  buildPd(data);
+
+  const N1 = data.teeth_angles.ring1.length;
+  const p1 = Math.PI * 2 / N1;
+  const j1 = Math.round(pd.th1 / p1 - 0.5);
+  const N2 = data.teeth_angles.ring2.length;
+  const p2 = Math.PI * 2 / N2;
+  const j2 = Math.round(pd.th2 / p2 - 0.5);
+
+  if (animId !== null) cancelAnimationFrame(animId);
+  paused     = false;
+  anim.phase = 0;
+  anim.a1    = pd.th1 - (j1 + 0.5) * p1;
+  anim.a2    = pd.th2 - (j2 + 0.5) * p2;
+  anim.t     = null;
+  animId     = requestAnimationFrame(frame);
+
+  if (pauseBtn) { pauseBtn.textContent = 'Pause'; pauseBtn.disabled = false; }
+
+  document.getElementById('stat-length').textContent     = data.chain_length.toFixed(1);
+  document.getElementById('stat-links').textContent      = data.num_links;
+  document.getElementById('stat-adj-center').textContent = data.adjusted_center.toFixed(2);
+  document.getElementById('stat-wrap1').textContent      = data.wrap_angle1.toFixed(1);
+  document.getElementById('stat-wrap2').textContent      = data.wrap_angle2.toFixed(1);
+  statsEl.classList.remove('hidden');
+}
+
+function togglePause() {
+  if (!geo) return;
+  if (paused) {
+    paused = false;
+    anim.t = null;  // reset timestamp so dt doesn't spike on resume
+    animId = requestAnimationFrame(frame);
+    pauseBtn.textContent = 'Pause';
+  } else {
+    paused = true;
+    if (animId !== null) { cancelAnimationFrame(animId); animId = null; }
+    pauseBtn.textContent = 'Play';
   }
 }
 
 document.getElementById('calculate-btn').addEventListener('click', calculate);
+document.getElementById('pause-btn').addEventListener('click', togglePause);
 
-resizeCanvas();
-calculate();
+// Defer initial load until after browser has computed flex layout,
+// so resizeCanvas() gets the correct canvas-container dimensions.
+requestAnimationFrame(calculate);
